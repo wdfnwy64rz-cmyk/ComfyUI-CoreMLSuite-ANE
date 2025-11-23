@@ -15,9 +15,10 @@ from diffusers import (
 )
 from python_coreml_stable_diffusion.unet import (
     UNet2DConditionModel,
-    UNet2DConditionModelXL,
     AttentionImplementations,
 )
+
+from coreml_suite.unet_sdxl_ane import build_sdxl_unet_for_ane
 
 from coreml_suite.config import ModelVersion
 from coreml_suite.lcm.unet import UNet2DConditionModelLCM
@@ -31,7 +32,7 @@ class StableDiffusionLCMPipeline(LatentConsistencyModelPipeline):
 
 MODEL_TYPE_TO_UNET_CLS = {
     ModelVersion.SD15: UNet2DConditionModel,
-    ModelVersion.SDXL: UNet2DConditionModelXL,
+    ModelVersion.SDXL: build_sdxl_unet_for_ane,
     ModelVersion.LCM: UNet2DConditionModelLCM,
 }
 
@@ -45,9 +46,44 @@ MODEL_TYPE_TO_PIPE_CLS = {
 def get_unet(model_type: ModelVersion, ref_pipe):
     ref_unet = ref_pipe.unet
 
-    unet_cls = MODEL_TYPE_TO_UNET_CLS[model_type]
-    cml_unet = unet_cls.from_config(ref_unet.config).eval()
-    cml_unet.load_state_dict(ref_unet.state_dict(), strict=False)
+    unet_factory = MODEL_TYPE_TO_UNET_CLS[model_type]
+
+    def _add_missing_bias_parameters(state_dict: dict[str, torch.Tensor]):
+        """Add zero biases for 1D weight tensors that lack a bias entry.
+
+        The Core ML UNet reorders LayerNorm parameters through a state dict hook
+        that assumes both ``weight`` and ``bias`` are present. Some SDXL
+        checkpoints omit certain LayerNorm biases, which causes a ``KeyError``
+        during ``load_state_dict``. Supplying zero biases keeps the hook happy
+        while remaining numerically neutral.
+        """
+
+        patched_state_dict = dict(state_dict)
+        for key, value in state_dict.items():
+            if not key.endswith(".weight") or value.ndim != 1:
+                continue
+
+            bias_key = key[:- len("weight")] + "bias"
+            if bias_key in patched_state_dict:
+                continue
+
+            patched_state_dict[bias_key] = torch.zeros_like(value)
+
+        return patched_state_dict
+
+    if model_type is ModelVersion.SDXL:
+        cml_unet = unet_factory(
+            ref_unet.config,
+            attention_impl=AttentionImplementations(
+                python_coreml_stable_diffusion.unet.ATTENTION_IMPLEMENTATION_IN_EFFECT
+            ),
+        )
+    else:
+        cml_unet = unet_factory.from_config(ref_unet.config).eval()
+
+    patched_state_dict = _add_missing_bias_parameters(ref_unet.state_dict())
+
+    cml_unet.load_state_dict(patched_state_dict, strict=False)
 
     return cml_unet
 
