@@ -15,11 +15,11 @@ from diffusers import (
 )
 from python_coreml_stable_diffusion.unet import (
     UNet2DConditionModel,
-    UNet2DConditionModelXL,
     AttentionImplementations,
 )
 
 from coreml_suite.config import ModelVersion
+from coreml_suite.ane_sdxl_unet import UNet2DConditionModelXLANE
 from coreml_suite.lcm.unet import UNet2DConditionModelLCM
 from coreml_suite.logger import logger
 from folder_paths import get_folder_paths
@@ -31,7 +31,7 @@ class StableDiffusionLCMPipeline(LatentConsistencyModelPipeline):
 
 MODEL_TYPE_TO_UNET_CLS = {
     ModelVersion.SD15: UNet2DConditionModel,
-    ModelVersion.SDXL: UNet2DConditionModelXL,
+    ModelVersion.SDXL: UNet2DConditionModelXLANE,
     ModelVersion.LCM: UNet2DConditionModelLCM,
 }
 
