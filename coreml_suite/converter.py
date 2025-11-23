@@ -135,6 +135,73 @@ def get_unet(model_type: ModelVersion, ref_pipe):
 
         return patched_state_dict
 
+    def _reshape_state_dict_for_coreml(cml_unet, ref_state_dict):
+        """Adapt the reference weights to the Core ML friendly UNet shape.
+
+        The ``UNet2DConditionModelXL`` variant from ``python_coreml_stable_diffusion``
+        swaps several Linear layers for 1x1 Conv layers and inflates certain channel
+        dimensions to satisfy ANE constraints. Diffusers checkpoints store the former
+        as ``[out, in]`` weights, while the Core ML model expects ``[out, in, 1, 1]``
+        kernels. This utility reshapes compatible tensors to match the target shape
+        and filters out irreconcilable entries so ``strict=False`` loading can
+        proceed without runtime errors.
+        """
+
+        def _maybe_unsqueeze_linear_to_conv(src, target):
+            if src.ndim == 2 and target.ndim == 4 and target.shape[2:] == (1, 1):
+                if src.shape[0] == target.shape[0] and src.shape[1] == target.shape[1]:
+                    return src.unsqueeze(-1).unsqueeze(-1)
+            return None
+
+        def _maybe_repeat_channels(src, target):
+            if src.ndim != target.ndim:
+                return None
+
+            if src.ndim == 1 and target.ndim == 1:
+                if target.shape[0] % src.shape[0] == 0:
+                    factor = target.shape[0] // src.shape[0]
+                    return src.repeat_interleave(factor)
+
+            if src.ndim == 4 and target.ndim == 4 and target.shape[2:] == src.shape[2:]:
+                same_hw = target.shape[2:] == src.shape[2:]
+                if same_hw and target.shape[0] % src.shape[0] == 0 and target.shape[1] % src.shape[1] == 0:
+                    out_factor = target.shape[0] // src.shape[0]
+                    in_factor = target.shape[1] // src.shape[1]
+                    return src.repeat(out_factor, in_factor, 1, 1)
+
+            return None
+
+        patched = {}
+        skipped = []
+
+        for name, target_param in cml_unet.state_dict().items():
+            src = ref_state_dict.get(name)
+            if src is None:
+                continue
+
+            if src.shape == target_param.shape:
+                patched[name] = src
+                continue
+
+            reshaped = _maybe_unsqueeze_linear_to_conv(src, target_param)
+            if reshaped is None:
+                reshaped = _maybe_repeat_channels(src, target_param)
+
+            if reshaped is not None and reshaped.shape == target_param.shape:
+                patched[name] = reshaped
+                continue
+
+            skipped.append((name, tuple(src.shape), tuple(target_param.shape)))
+
+        if skipped:
+            logger.warning(
+                "Skipping %d UNet weights due to irreconcilable shape mismatches: %s",
+                len(skipped),
+                ", ".join(f"{k}:{s}->{t}" for k, s, t in skipped[:5]),
+            )
+
+        return patched
+
     if model_type is ModelVersion.SDXL:
         cml_unet = unet_factory(
             ref_unet.config,
@@ -148,8 +215,9 @@ def get_unet(model_type: ModelVersion, ref_pipe):
     _patch_layer_norm_hooks(cml_unet)
 
     patched_state_dict = _inject_missing_bias_tensors(cml_unet, ref_unet.state_dict())
+    reshaped_state_dict = _reshape_state_dict_for_coreml(cml_unet, patched_state_dict)
 
-    cml_unet.load_state_dict(patched_state_dict, strict=False)
+    cml_unet.load_state_dict(reshaped_state_dict, strict=False)
 
     return cml_unet
 
