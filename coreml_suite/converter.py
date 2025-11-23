@@ -202,6 +202,19 @@ def get_unet(model_type: ModelVersion, ref_pipe):
 
         return patched
 
+    def _maybe_cast_unet_to_fp16(cml_unet):
+        """Align weights/biases with fp16 inputs when requested.
+
+        The ANE-oriented SDXL UNet casts its inputs to ``float16`` in ``forward``
+        to maintain Core ML compatibility. Torch ``conv2d`` kernels require input
+        and weight/bias tensors to share a dtype, so we mirror that casting on the
+        model parameters after loading the checkpoint. Other UNet variants leave
+        their parameters untouched.
+        """
+
+        if getattr(cml_unet, "cast_inputs_to_float16", False):
+            cml_unet.to(torch.float16)
+
     if model_type is ModelVersion.SDXL:
         cml_unet = unet_factory(
             ref_unet.config,
@@ -218,6 +231,8 @@ def get_unet(model_type: ModelVersion, ref_pipe):
     reshaped_state_dict = _reshape_state_dict_for_coreml(cml_unet, patched_state_dict)
 
     cml_unet.load_state_dict(reshaped_state_dict, strict=False)
+
+    _maybe_cast_unet_to_fp16(cml_unet)
 
     return cml_unet
 
