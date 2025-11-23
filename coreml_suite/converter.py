@@ -1,3 +1,4 @@
+import copy
 import gc
 import os
 import shutil
@@ -18,7 +19,10 @@ from python_coreml_stable_diffusion.unet import (
     AttentionImplementations,
 )
 
-from coreml_suite.unet_sdxl_ane import build_sdxl_unet_for_ane
+from coreml_suite.unet_sdxl_ane import (
+    _maybe_create_text_time_modules,
+    build_sdxl_unet_for_ane,
+)
 
 from coreml_suite.config import ModelVersion
 from coreml_suite.lcm.unet import UNet2DConditionModelLCM
@@ -202,6 +206,30 @@ def get_unet(model_type: ModelVersion, ref_pipe):
 
         return patched
 
+    def _ensure_text_time_modules(cml_unet, ref_unet):
+        """Restore SDXL text-time modules when configs omit them."""
+
+        # If the modules already exist, nothing to do.
+        has_time_proj = hasattr(cml_unet, "add_time_proj")
+        has_add_embedding = hasattr(cml_unet, "add_embedding")
+        if has_time_proj and has_add_embedding:
+            return
+
+        # Prefer cloning the reference UNet modules when available to ensure
+        # shapes match the incoming checkpoint.
+        if not has_time_proj and hasattr(ref_unet, "add_time_proj"):
+            cml_unet.add_time_proj = copy.deepcopy(ref_unet.add_time_proj)
+            has_time_proj = True
+
+        if not has_add_embedding and hasattr(ref_unet, "add_embedding"):
+            cml_unet.add_embedding = copy.deepcopy(ref_unet.add_embedding)
+            has_add_embedding = True
+
+        # Fall back to config-based reconstruction if reference modules were not
+        # present. This mirrors the ANE UNet's forward-guard behaviour.
+        if not (has_time_proj and has_add_embedding):
+            _maybe_create_text_time_modules(cml_unet)
+
     if model_type is ModelVersion.SDXL:
         cml_unet = unet_factory(
             ref_unet.config,
@@ -209,6 +237,7 @@ def get_unet(model_type: ModelVersion, ref_pipe):
                 python_coreml_stable_diffusion.unet.ATTENTION_IMPLEMENTATION_IN_EFFECT
             ),
         )
+        _ensure_text_time_modules(cml_unet, ref_unet)
     else:
         cml_unet = unet_factory.from_config(ref_unet.config).eval()
 
