@@ -15,9 +15,10 @@ from diffusers import (
 )
 from python_coreml_stable_diffusion.unet import (
     UNet2DConditionModel,
-    UNet2DConditionModelXL,
     AttentionImplementations,
 )
+
+from coreml_suite.unet_sdxl_ane import build_sdxl_unet_for_ane
 
 from coreml_suite.config import ModelVersion
 from coreml_suite.lcm.unet import UNet2DConditionModelLCM
@@ -31,7 +32,7 @@ class StableDiffusionLCMPipeline(LatentConsistencyModelPipeline):
 
 MODEL_TYPE_TO_UNET_CLS = {
     ModelVersion.SD15: UNet2DConditionModel,
-    ModelVersion.SDXL: UNet2DConditionModelXL,
+    ModelVersion.SDXL: build_sdxl_unet_for_ane,
     ModelVersion.LCM: UNet2DConditionModelLCM,
 }
 
@@ -45,9 +46,193 @@ MODEL_TYPE_TO_PIPE_CLS = {
 def get_unet(model_type: ModelVersion, ref_pipe):
     ref_unet = ref_pipe.unet
 
-    unet_cls = MODEL_TYPE_TO_UNET_CLS[model_type]
-    cml_unet = unet_cls.from_config(ref_unet.config).eval()
-    cml_unet.load_state_dict(ref_unet.state_dict(), strict=False)
+    unet_factory = MODEL_TYPE_TO_UNET_CLS[model_type]
+
+    def _patch_layer_norm_hooks(cml_unet):
+        """Avoid state dict loading errors for missing LayerNorm bias weights.
+
+        The upstream ``python_coreml_stable_diffusion`` package registers a
+        ``load_state_dict`` pre-hook that assumes both ``bias`` and ``weight``
+        tensors are present. SDXL checkpoints do not always contain a bias term,
+        which triggers a ``KeyError`` during conversion. By replacing the global
+        hook reference **and** wrapping any existing registrations, we can keep
+        the bias correction behaviour when both tensors exist while gracefully
+        skipping it when they do not.
+        """
+
+        import python_coreml_stable_diffusion.unet as pcmsd_unet
+
+        original_hook = getattr(
+            pcmsd_unet, "correct_for_bias_scale_order_inversion", None
+        )
+
+        if original_hook is None:
+            return
+
+        def _guard_missing_bias(hook):
+            def _safe_correct_for_bias_scale_order_inversion(
+                state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+            ):
+                bias_key = prefix + "bias"
+                weight_key = prefix + "weight"
+
+                if bias_key not in state_dict or weight_key not in state_dict:
+                    # Let the normal missing key reporting handle the absence. This
+                    # prevents ``KeyError`` while still surfacing missing weights in
+                    # ``missing_keys`` if ``strict`` is True.
+                    if strict and bias_key not in missing_keys:
+                        missing_keys.append(bias_key)
+                    return state_dict
+
+                try:
+                    return hook(
+                        state_dict,
+                        prefix,
+                        local_metadata,
+                        strict,
+                        missing_keys,
+                        unexpected_keys,
+                        error_msgs,
+                    )
+                except KeyError as exc:  # pragma: no cover - defensive
+                    error_msgs.append(str(exc))
+                    return state_dict
+
+            return _safe_correct_for_bias_scale_order_inversion
+
+        # Replace global reference so newly constructed modules use the guarded hook
+        pcmsd_unet.correct_for_bias_scale_order_inversion = _guard_missing_bias(
+            original_hook
+        )
+
+        # Update already-registered hooks on existing LayerNormANE modules
+        for module in cml_unet.modules():
+            hooks = getattr(module, "_load_state_dict_pre_hooks", None)
+            if not hooks:
+                continue
+
+            for key, hook in list(hooks.items()):
+                hooks[key] = _guard_missing_bias(hook)
+
+    def _inject_missing_bias_tensors(cml_unet, ref_state_dict):
+        """Fill in missing LayerNorm bias tensors so pre-hooks do not fail."""
+
+        patched_state_dict = ref_state_dict.copy()
+
+        for name, param in cml_unet.named_parameters():
+            if not name.endswith("bias"):
+                continue
+
+            if name in patched_state_dict:
+                continue
+
+            weight_key = name[: -len("bias")] + "weight"
+            weight = patched_state_dict.get(weight_key)
+            if weight is None:
+                continue
+
+            patched_state_dict[name] = torch.zeros_like(weight)
+
+        return patched_state_dict
+
+    def _reshape_state_dict_for_coreml(cml_unet, ref_state_dict):
+        """Adapt the reference weights to the Core ML friendly UNet shape.
+
+        The ``UNet2DConditionModelXL`` variant from ``python_coreml_stable_diffusion``
+        swaps several Linear layers for 1x1 Conv layers and inflates certain channel
+        dimensions to satisfy ANE constraints. Diffusers checkpoints store the former
+        as ``[out, in]`` weights, while the Core ML model expects ``[out, in, 1, 1]``
+        kernels. This utility reshapes compatible tensors to match the target shape
+        and filters out irreconcilable entries so ``strict=False`` loading can
+        proceed without runtime errors.
+        """
+
+        def _maybe_unsqueeze_linear_to_conv(src, target):
+            if src.ndim == 2 and target.ndim == 4 and target.shape[2:] == (1, 1):
+                if src.shape[0] == target.shape[0] and src.shape[1] == target.shape[1]:
+                    return src.unsqueeze(-1).unsqueeze(-1)
+            return None
+
+        def _maybe_repeat_channels(src, target):
+            if src.ndim != target.ndim:
+                return None
+
+            if src.ndim == 1 and target.ndim == 1:
+                if target.shape[0] % src.shape[0] == 0:
+                    factor = target.shape[0] // src.shape[0]
+                    return src.repeat_interleave(factor)
+
+            if src.ndim == 4 and target.ndim == 4 and target.shape[2:] == src.shape[2:]:
+                same_hw = target.shape[2:] == src.shape[2:]
+                if same_hw and target.shape[0] % src.shape[0] == 0 and target.shape[1] % src.shape[1] == 0:
+                    out_factor = target.shape[0] // src.shape[0]
+                    in_factor = target.shape[1] // src.shape[1]
+                    return src.repeat(out_factor, in_factor, 1, 1)
+
+            return None
+
+        patched = {}
+        skipped = []
+
+        for name, target_param in cml_unet.state_dict().items():
+            src = ref_state_dict.get(name)
+            if src is None:
+                continue
+
+            if src.shape == target_param.shape:
+                patched[name] = src
+                continue
+
+            reshaped = _maybe_unsqueeze_linear_to_conv(src, target_param)
+            if reshaped is None:
+                reshaped = _maybe_repeat_channels(src, target_param)
+
+            if reshaped is not None and reshaped.shape == target_param.shape:
+                patched[name] = reshaped
+                continue
+
+            skipped.append((name, tuple(src.shape), tuple(target_param.shape)))
+
+        if skipped:
+            logger.warning(
+                "Skipping %d UNet weights due to irreconcilable shape mismatches: %s",
+                len(skipped),
+                ", ".join(f"{k}:{s}->{t}" for k, s, t in skipped[:5]),
+            )
+
+        return patched
+
+    def _maybe_cast_unet_to_fp16(cml_unet):
+        """Align weights/biases with fp16 inputs when requested.
+
+        The ANE-oriented SDXL UNet casts its inputs to ``float16`` in ``forward``
+        to maintain Core ML compatibility. Torch ``conv2d`` kernels require input
+        and weight/bias tensors to share a dtype, so we mirror that casting on the
+        model parameters after loading the checkpoint. Other UNet variants leave
+        their parameters untouched.
+        """
+
+        if getattr(cml_unet, "cast_inputs_to_float16", False):
+            cml_unet.to(torch.float16)
+
+    if model_type is ModelVersion.SDXL:
+        cml_unet = unet_factory(
+            ref_unet.config,
+            attention_impl=AttentionImplementations(
+                python_coreml_stable_diffusion.unet.ATTENTION_IMPLEMENTATION_IN_EFFECT
+            ),
+        )
+    else:
+        cml_unet = unet_factory.from_config(ref_unet.config).eval()
+
+    _patch_layer_norm_hooks(cml_unet)
+
+    patched_state_dict = _inject_missing_bias_tensors(cml_unet, ref_unet.state_dict())
+    reshaped_state_dict = _reshape_state_dict_for_coreml(cml_unet, patched_state_dict)
+
+    cml_unet.load_state_dict(reshaped_state_dict, strict=False)
+
+    _maybe_cast_unet_to_fp16(cml_unet)
 
     return cml_unet
 
