@@ -17,6 +17,8 @@ import torch
 from python_coreml_stable_diffusion import attention
 from python_coreml_stable_diffusion.unet import (
     AttentionImplementations,
+    TimestepEmbedding,
+    Timesteps,
     UNet2DConditionModelXL,
 )
 
@@ -44,6 +46,28 @@ class UNet2DConditionModelXLANE(UNet2DConditionModelXL):
         attention.ATTENTION_IMPLEMENTATION_IN_EFFECT = attention_implementation
         super().__init__(*args, **kwargs)
         self.cast_inputs_to_float16 = cast_inputs_to_float16
+
+        # ``python_coreml_stable_diffusion`` only constructs the extra SDXL time
+        # embedding modules when ``addition_embed_type`` is set to "text_time" at
+        # initialisation time. Some pipelines omit that field from the config,
+        # which leaves ``add_time_proj``/``add_embedding`` undefined even though
+        # the forward pass expects them. Recreate the pair when missing so
+        # TorchScript tracing does not fail.
+        add_type = getattr(self.config, "addition_embed_type", None)
+        if add_type == "text_time":
+            if not hasattr(self, "add_time_proj"):
+                self.add_time_proj = Timesteps(
+                    self.config.addition_time_embed_dim,
+                    self.config.flip_sin_to_cos,
+                    self.config.freq_shift,
+                )
+
+            if not hasattr(self, "add_embedding"):
+                time_embed_dim = self.config.block_out_channels[0] * 4
+                self.add_embedding = TimestepEmbedding(
+                    self.config.projection_class_embeddings_input_dim,
+                    time_embed_dim,
+                )
 
     def _cast_if_needed(self, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if tensor is None or not self.cast_inputs_to_float16:
