@@ -54,9 +54,10 @@ def get_unet(model_type: ModelVersion, ref_pipe):
         The upstream ``python_coreml_stable_diffusion`` package registers a
         ``load_state_dict`` pre-hook that assumes both ``bias`` and ``weight``
         tensors are present. SDXL checkpoints do not always contain a bias term,
-        which triggers a ``KeyError`` during conversion. By swapping the hook for
-        a guarded variant and replacing existing registrations, we can skip the
-        correction when the checkpoint does not provide the expected tensors.
+        which triggers a ``KeyError`` during conversion. By replacing the global
+        hook reference **and** wrapping any existing registrations, we can keep
+        the bias correction behaviour when both tensors exist while gracefully
+        skipping it when they do not.
         """
 
         import python_coreml_stable_diffusion.unet as pcmsd_unet
@@ -68,28 +69,40 @@ def get_unet(model_type: ModelVersion, ref_pipe):
         if original_hook is None:
             return
 
-        def _safe_correct_for_bias_scale_order_inversion(
-            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
-        ):
-            bias_key = prefix + "bias"
-            weight_key = prefix + "weight"
+        def _guard_missing_bias(hook):
+            def _safe_correct_for_bias_scale_order_inversion(
+                state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+            ):
+                bias_key = prefix + "bias"
+                weight_key = prefix + "weight"
 
-            if bias_key not in state_dict or weight_key not in state_dict:
-                # Let the normal missing key reporting handle the absence. This
-                # prevents ``KeyError`` while still surfacing missing weights in
-                # ``missing_keys`` if ``strict`` is True.
-                return state_dict
+                if bias_key not in state_dict or weight_key not in state_dict:
+                    # Let the normal missing key reporting handle the absence. This
+                    # prevents ``KeyError`` while still surfacing missing weights in
+                    # ``missing_keys`` if ``strict`` is True.
+                    if strict and bias_key not in missing_keys:
+                        missing_keys.append(bias_key)
+                    return state_dict
 
-            try:
-                state_dict[bias_key] = state_dict[bias_key] / state_dict[weight_key]
-            except Exception as exc:  # pragma: no cover - defensive
-                error_msgs.append(str(exc))
+                try:
+                    return hook(
+                        state_dict,
+                        prefix,
+                        local_metadata,
+                        strict,
+                        missing_keys,
+                        unexpected_keys,
+                        error_msgs,
+                    )
+                except KeyError as exc:  # pragma: no cover - defensive
+                    error_msgs.append(str(exc))
+                    return state_dict
 
-            return state_dict
+            return _safe_correct_for_bias_scale_order_inversion
 
         # Replace global reference so newly constructed modules use the guarded hook
-        pcmsd_unet.correct_for_bias_scale_order_inversion = (
-            _safe_correct_for_bias_scale_order_inversion
+        pcmsd_unet.correct_for_bias_scale_order_inversion = _guard_missing_bias(
+            original_hook
         )
 
         # Update already-registered hooks on existing LayerNormANE modules
@@ -99,8 +112,7 @@ def get_unet(model_type: ModelVersion, ref_pipe):
                 continue
 
             for key, hook in list(hooks.items()):
-                if hook is original_hook:
-                    hooks[key] = _safe_correct_for_bias_scale_order_inversion
+                hooks[key] = _guard_missing_bias(hook)
 
     def _inject_missing_bias_tensors(cml_unet, ref_state_dict):
         """Fill in missing LayerNorm bias tensors so pre-hooks do not fail."""
