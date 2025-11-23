@@ -48,6 +48,60 @@ def get_unet(model_type: ModelVersion, ref_pipe):
 
     unet_factory = MODEL_TYPE_TO_UNET_CLS[model_type]
 
+    def _patch_layer_norm_hooks(cml_unet):
+        """Avoid state dict loading errors for missing LayerNorm bias weights.
+
+        The upstream ``python_coreml_stable_diffusion`` package registers a
+        ``load_state_dict`` pre-hook that assumes both ``bias`` and ``weight``
+        tensors are present. SDXL checkpoints do not always contain a bias term,
+        which triggers a ``KeyError`` during conversion. By swapping the hook for
+        a guarded variant and replacing existing registrations, we can skip the
+        correction when the checkpoint does not provide the expected tensors.
+        """
+
+        import python_coreml_stable_diffusion.unet as pcmsd_unet
+
+        original_hook = getattr(
+            pcmsd_unet, "correct_for_bias_scale_order_inversion", None
+        )
+
+        if original_hook is None:
+            return
+
+        def _safe_correct_for_bias_scale_order_inversion(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        ):
+            bias_key = prefix + "bias"
+            weight_key = prefix + "weight"
+
+            if bias_key not in state_dict or weight_key not in state_dict:
+                # Let the normal missing key reporting handle the absence. This
+                # prevents ``KeyError`` while still surfacing missing weights in
+                # ``missing_keys`` if ``strict`` is True.
+                return state_dict
+
+            try:
+                state_dict[bias_key] = state_dict[bias_key] / state_dict[weight_key]
+            except Exception as exc:  # pragma: no cover - defensive
+                error_msgs.append(str(exc))
+
+            return state_dict
+
+        # Replace global reference so newly constructed modules use the guarded hook
+        pcmsd_unet.correct_for_bias_scale_order_inversion = (
+            _safe_correct_for_bias_scale_order_inversion
+        )
+
+        # Update already-registered hooks on existing LayerNormANE modules
+        for module in cml_unet.modules():
+            hooks = getattr(module, "_load_state_dict_pre_hooks", None)
+            if not hooks:
+                continue
+
+            for key, hook in list(hooks.items()):
+                if hook is original_hook:
+                    hooks[key] = _safe_correct_for_bias_scale_order_inversion
+
     if model_type is ModelVersion.SDXL:
         cml_unet = unet_factory(
             ref_unet.config,
@@ -57,6 +111,8 @@ def get_unet(model_type: ModelVersion, ref_pipe):
         )
     else:
         cml_unet = unet_factory.from_config(ref_unet.config).eval()
+
+    _patch_layer_norm_hooks(cml_unet)
 
     cml_unet.load_state_dict(ref_unet.state_dict(), strict=False)
 
