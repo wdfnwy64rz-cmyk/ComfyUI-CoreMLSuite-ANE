@@ -102,6 +102,27 @@ def get_unet(model_type: ModelVersion, ref_pipe):
                 if hook is original_hook:
                     hooks[key] = _safe_correct_for_bias_scale_order_inversion
 
+    def _inject_missing_bias_tensors(cml_unet, ref_state_dict):
+        """Fill in missing LayerNorm bias tensors so pre-hooks do not fail."""
+
+        patched_state_dict = ref_state_dict.copy()
+
+        for name, param in cml_unet.named_parameters():
+            if not name.endswith("bias"):
+                continue
+
+            if name in patched_state_dict:
+                continue
+
+            weight_key = name[: -len("bias")] + "weight"
+            weight = patched_state_dict.get(weight_key)
+            if weight is None:
+                continue
+
+            patched_state_dict[name] = torch.zeros_like(weight)
+
+        return patched_state_dict
+
     if model_type is ModelVersion.SDXL:
         cml_unet = unet_factory(
             ref_unet.config,
@@ -114,7 +135,9 @@ def get_unet(model_type: ModelVersion, ref_pipe):
 
     _patch_layer_norm_hooks(cml_unet)
 
-    cml_unet.load_state_dict(ref_unet.state_dict(), strict=False)
+    patched_state_dict = _inject_missing_bias_tensors(cml_unet, ref_unet.state_dict())
+
+    cml_unet.load_state_dict(patched_state_dict, strict=False)
 
     return cml_unet
 
