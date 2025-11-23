@@ -47,7 +47,26 @@ def get_unet(model_type: ModelVersion, ref_pipe):
 
     unet_cls = MODEL_TYPE_TO_UNET_CLS[model_type]
     cml_unet = unet_cls.from_config(ref_unet.config).eval()
-    cml_unet.load_state_dict(ref_unet.state_dict(), strict=False)
+
+    state_dict = ref_unet.state_dict()
+
+    # Some SDXL checkpoints omit LayerNorm biases while the Core ML UNet expects
+    # them for the scale/bias correction hook. Create zero biases to avoid
+    # KeyErrors during loading while preserving the original weights.
+    missing_biases_added = 0
+    for key, value in list(state_dict.items()):
+        if key.endswith(".scale"):
+            bias_key = key.replace(".scale", ".bias")
+            if bias_key not in state_dict:
+                state_dict[bias_key] = torch.zeros_like(value)
+                missing_biases_added += 1
+
+    if missing_biases_added:
+        logger.warning(
+            f"Added {missing_biases_added} missing LayerNorm biases to UNet state dict"
+        )
+
+    cml_unet.load_state_dict(state_dict, strict=False)
 
     return cml_unet
 
