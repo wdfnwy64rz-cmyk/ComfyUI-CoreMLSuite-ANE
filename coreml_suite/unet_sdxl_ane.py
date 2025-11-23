@@ -110,6 +110,7 @@ class UNet2DConditionModelXLANE(UNet2DConditionModelXL):
         # requested. The ANE kernels expect fp16 tensors and conversion inside
         # the graph avoids Core ML inserting GPU-only casts.
         sample = self._cast_if_needed(sample)
+        timestep = self._cast_if_needed(timestep)
         encoder_hidden_states = self._cast_if_needed(encoder_hidden_states)
         text_embeds = self._cast_if_needed(text_embeds)
         time_ids = self._cast_if_needed(time_ids)
